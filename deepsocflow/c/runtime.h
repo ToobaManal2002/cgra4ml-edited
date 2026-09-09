@@ -26,10 +26,12 @@ static inline idiv_t idiv(int numer, int denom) {
 
 typedef const struct {
   const u16  n, l, kw, coe, h, w, ci, co, w_kw2, t, p, cm, cm_p0, on, oh, ow, oc, ch, ph, cw, pw, pkh, psh, pkw, psw;
-  const i32  xp_words, b_offset, w_bpt, w_bpt_p0, x_bpt, x_bpt_p0, o_words, o_bytes;
+  const i32  xp_words, b_offset, w_bpt, w_bpt_p0, x_bpt, x_bpt_p0, o_words, o_bytes, ln_gamma_offset, ln_beta_offset;
   const i8   ib_out, in_buffer_idx, out_buffer_idx, add_out_buffer_idx, add_in_buffer_idx;
-  const i8   is_bias, is_pool, is_flatten, is_softmax;
-  const i8   x_pad, b_val_shift, b_bias_shift, ca_nzero, ca_shift, ca_pl_scale, aa_nzero, aa_shift, aa_pl_scale, pa_nzero, pa_shift, pa_pl_scale, softmax_frac;
+  const i8   is_bias, is_pool, is_flatten, is_softmax, is_gelu, is_layernorm;
+  //const i8   x_pad, b_val_shift, b_bias_shift, ca_nzero, ca_shift, ca_pl_scale, aa_nzero, aa_shift, aa_pl_scale, pa_nzero, pa_shift, pa_pl_scale, softmax_frac;
+  const i8   x_pad, b_val_shift, b_bias_shift, ca_nzero, ca_shift, ca_pl_scale, aa_nzero, aa_shift, aa_pl_scale, pa_nzero, pa_shift, pa_pl_scale, softmax_frac, ca_frac, ln_frac;
+  
   const i8   csh, csh_shift, psh_shift, csw, csw_shift, psw_shift, pool;
   const i32  softmax_max_i;
   const u64  header;
@@ -156,6 +158,65 @@ static inline i32 quant_lrelu(i32 x, i8 nzero, i8 shift, i8 pl_scale){
   x = clip(x, -(1<<(X_BITS-pl_scale-1)), (1<<(X_BITS-1))-1);
   return x;
 }
+
+// adding gelu 
+static inline i32 quant_gelu(i32 x, i8 shift, i8 frac_bits) {
+  // Step 1: Convert fixed-point integer to float
+  float scale = (float)(1 << frac_bits);
+  float x_f = (float)x / scale;
+
+  // Step 2: Apply GELU formula
+  float x3 = x_f * x_f * x_f;
+  float inner = 0.7978845608f * (x_f + 0.044715f * x3);
+  float gelu_val = 0.5f * x_f * (1.0f + tanhf(inner));
+
+  // Step 3: Convert back to fixed-point
+  i32 result = (i32)(gelu_val * scale);
+
+  // Step 4: Shift and clip (same as quant_lrelu does)
+  result = shift_round(result, shift);
+  result = clip(result, -(1<<(X_BITS-1)), (1<<(X_BITS-1))-1);
+  return result;
+}
+
+//for layernorm
+static inline void apply_layernorm(i32 *nhwc_buf, B_TYPE *gamma_buf, B_TYPE *beta_buf,
+                                   i32 base_idx, i32 co, i8 frac) {
+
+    float scale = (float)(1 << frac);
+
+    // Step 1: Compute mean across all channels
+    float sum = 0.0f;
+    for (i32 i = 0; i < co; i++) {
+        sum += (float)nhwc_buf[base_idx + i] / scale;
+    }
+    float mean = sum / (float)co;
+
+    // Step 2: Compute variance
+    float var_sum = 0.0f;
+    for (i32 i = 0; i < co; i++) {
+        float val = (float)nhwc_buf[base_idx + i] / scale;
+        float diff = val - mean;
+        var_sum += diff * diff;
+    }
+    float variance = var_sum / (float)co;
+    float inv_std = 1.0f / sqrtf(variance + 1e-5f);
+
+    // Step 3: Normalize, scale by gamma, shift by beta
+    for (i32 i = 0; i < co; i++) {
+        float val = (float)nhwc_buf[base_idx + i] / scale;
+        float normalized = (val - mean) * inv_std;
+
+        float g = (float)gamma_buf[i] / scale;  // gamma weight
+        float b = (float)beta_buf[i] / scale;   // beta weight
+
+        float result = g * normalized + b;
+
+        // Convert back to fixed-point and store
+        nhwc_buf[base_idx + i] = (i32)roundf(result * scale);
+    }
+}
+
 
 
 static inline void write_x(i8 val, i8 *restrict p_out_buffer, Memory_st *restrict mp, i32 ib, i32 ixp, i32 ixn, i32 ixl, i32 ixw, i32 ixcm, i32 ixr, Bundle_t *restrict pb_out, i32 xcm) {
@@ -380,7 +441,14 @@ extern EXT_C void run(Memory_st *restrict mp) {
 
 
                     // ------ CORE ACT ------
-                    out_val = quant_lrelu(out_val, pb->ca_nzero, pb->ca_shift, pb->ca_pl_scale);
+                    //out_val = quant_lrelu(out_val, pb->ca_nzero, pb->ca_shift, pb->ca_pl_scale);
+                    if (pb->is_gelu)
+                      //out_val = quant_gelu(out_val, pb->ca_shift, pb->softmax_frac);
+                      out_val = quant_gelu(out_val, pb->ca_shift, pb->ca_frac);
+                    else
+                      out_val = quant_lrelu(out_val, pb->ca_nzero, pb->ca_shift, pb->ca_pl_scale);
+
+
 
                     // ------ RESIDUAL ADD ---
 
@@ -390,10 +458,45 @@ extern EXT_C void run(Memory_st *restrict mp) {
                       out_val = quant_lrelu(out_val, pb->aa_nzero, pb->aa_shift, pb->aa_pl_scale);
                     }
 
+                    // ------ LAYER NORM ------
+
+                    if (pb->is_layernorm) {
+                      // Store current value into nhwc buffer
+                      iy_nhwc = flatten_nhwc(i_yn,i_yh,i_yw,i_yc, yn,yh,yw,yc, "Before layernorm", DEBUG_INFO);
+                      mp->nhwc[iy_nhwc] = out_val;
+
+                      // When we reach the LAST channel: normalize all channels
+                      if (i_yc == pb->co - 1) {
+                        // Find the starting index for this spatial position
+                        i32 base = flatten_nhwc(i_yn,i_yh,i_yw,0, yn,yh,yw,yc, "LN base", DEBUG_INFO);
+
+                        // Get gamma and beta weight pointers
+                        // Must be B_TYPE (int16_t), NOT i32 -- mp->b is a
+                        // B_TYPE array, so an i32* would misread every value.
+                        B_TYPE *gamma_ptr = &mp->b[pb->ln_gamma_offset];
+                        B_TYPE *beta_ptr  = &mp->b[pb->ln_beta_offset];
+
+                        // Apply LayerNorm across all channels
+                        apply_layernorm(mp->nhwc, gamma_ptr, beta_ptr,
+                                        base, pb->co, pb->ln_frac);
+
+                        // Write normalized values out
+                        for (i32 ic = 0; ic < pb->co; ic++) {
+                          i32 idx = flatten_nhwc(i_yn,i_yh,i_yw,ic, yn,yh,yw,yc, "LN write", DEBUG_INFO);
+                          i32 ln_val = mp->nhwc[idx];
+                          ln_val = clip(ln_val, -(1<<(X_BITS-1)), (1<<(X_BITS-1))-1);
+                          tile_write((i8)ln_val, p_out_buffer, ib, pb, mp,
+                                     i_yn, i_yh, i_yw, ic, yn, yh, yw, yc);
+                        }
+                      }
+                      goto PROCESS_AND_STORE_DONE;
+                    }
+
                     // ------ SOFTMAX ------
 
                     if (pb->is_softmax) {
-                      assert_printf (ib , !=, N_BUNDLES, "Softmax is only allowed for the last bundle.", DEBUG_INFO);
+                      // Removed: assert that restricted softmax to last bundle only
+                      // Now softmax works for ANY bundle (needed for ViT attention)
 
                       f32__ val = (f32__)out_val;
                       val = val / (f32__)(1 << pb->softmax_frac);
@@ -402,19 +505,37 @@ extern EXT_C void run(Memory_st *restrict mp) {
                       mp->y[iy_nhwc] = val;
 
                       if (i_yc == pb->co-1) {
+                        // Sum all e^x values
                         f32__ sum = 0;
                         i32 iy_nhwc;
                         for (int i=0; i<pb->co; i++){
                           iy_nhwc = flatten_nhwc(i_yn,i_yh,i_yw,i, yn,yh,yw,yc, "Before softmax sum", DEBUG_INFO);
                           sum += mp->y[iy_nhwc];
                         }
+
+                        // Divide each by sum → probabilities
                         for (int i=0; i<pb->co; i++){
                           iy_nhwc = flatten_nhwc(i_yn,i_yh,i_yw,i, yn,yh,yw,yc, "After softmax sum", DEBUG_INFO);
                           mp->y[iy_nhwc] = mp->y[iy_nhwc] / sum;
                         }
+
+                        // >>> NEW: If NOT the last bundle, convert back to
+                        // fixed-point and write to output for next bundle >>>
+                        if (ib != N_BUNDLES-1) {
+                          for (int i=0; i<pb->co; i++){
+                            iy_nhwc = flatten_nhwc(i_yn,i_yh,i_yw,i, yn,yh,yw,yc, "Softmax tile_write", DEBUG_INFO);
+                            // Convert float probability back to fixed-point integer
+                            i32 fixed_val = (i32)(mp->y[iy_nhwc] * (f32__)(1 << pb->softmax_frac));
+                            fixed_val = clip(fixed_val, -(1<<(X_BITS-1)), (1<<(X_BITS-1))-1);
+                            tile_write((i8)fixed_val, p_out_buffer, ib, pb, mp,
+                                       i_yn, i_yh, i_yw, i, yn, yh, yw, yc);
+                          }
+                        }
+                        // >>> END NEW >>>
                       }
                       goto PROCESS_AND_STORE_DONE;
                     }
+
 
                     // ------ MAX/AVG POOL ---
 

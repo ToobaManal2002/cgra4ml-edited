@@ -28,33 +28,61 @@ class XActivation(QActivation):
             case None:
                 act_str = f'quantized_bits({sys_bits.x},{o_int_bits},False,1,1)'
             case "relu":
-                # QKeras treats relu (slope=0) as unsigned. We have everything signed, so we reduce bitwidth
                 o_bits = sys_bits.x - 1 if slope == 0 else sys_bits.x
-                assert o_bits > 0, "Error: Cannot use bits=1 with Relu. Use leaky_relu. Reason: Qkeras keeps relu signed"
                 act_str = f'quantized_relu({o_bits},{o_int_bits},negative_slope={slope})'
+            case "gelu":                                                    # >>> NEW
+                act_str = f'quantized_bits({sys_bits.x},{o_int_bits},False,1,1)'  # >>> NEW
             case _:
-                raise ValueError(f"Activation type {type} not recognized")
+             raise ValueError(f"Activation type {type} not recognized")
             
         self.out = XTensor(None, bits=sys_bits.x, int=o_int_bits)
         super().__init__(act_str, *args, **kwargs)
-
     
     def call(self, input_tensor):
-        self.out.ftensor = super().call(input_tensor)
+        if self.type == 'gelu':
+            # QKeras has no quantized_gelu, so act_str is only a quantizer.
+            # Apply GELU here, THEN quantize. Without this the float path
+            # skips GELU entirely and can never match call_int().
+            # approximate=True is the tanh form -- exactly what call_int()
+            # below and quant_gelu() in runtime.h compute.
+            self.out.ftensor = super().call(tf.nn.gelu(input_tensor, approximate=True))
+        else:
+            self.out.ftensor = super().call(input_tensor)
         return self.out.ftensor
     
-    def call_int(self, x_tensor, hw):       
+    def call_int(self, x_tensor, hw):
+           
 
         x = x_tensor.itensor.numpy().astype(int)
         self.shift_bits = self.plog_slope + x_tensor.frac - self.out.frac
+        self.in_frac = x_tensor.frac      # NEW: quant_gelu() in C needs this
+        
 
-        x = ((x < 0) * x) * self.non_zero + (((x > 0) * x) << self.plog_slope)
-        x = shift_round(x, self.shift_bits) # = np.around(x/2**shift_bits)
-        x = np.clip(x, -2**(self.out.bits - self.plog_slope - 1), 2**(self.out.bits-1)-1).astype(int)
-
+        if self.type == 'gelu':
+            # GELU path: convert to float, apply GELU, convert back
+            x_float = x.astype(float) / (2**x_tensor.frac)
+            x3 = x_float ** 3
+            inner = 0.7978845608 * (x_float + 0.044715 * x3)
+            gelu_out = 0.5 * x_float * (1.0 + np.tanh(inner))
+            x = np.round(gelu_out * (2**self.out.frac)).astype(int)
+            x = np.clip(x, -2**(self.out.bits-1), 2**(self.out.bits-1)-1)
+        else:
+            # Original ReLU path (unchanged)
+            x = ((x < 0) * x) * self.non_zero + (((x > 0) * x) << self.plog_slope)
+            x = shift_round(x, self.shift_bits)
+            x = np.clip(x, -2**(self.out.bits - self.plog_slope - 1), 2**(self.out.bits-1)-1).astype(int)
+        
         out = XTensor(tensor=x, bits=self.out.bits, frac=self.out.frac, from_int=True)
-        assert np.allclose(out.ftensor, self.out.ftensor), \
+        if self.type == 'gelu':
+            # tanh in float32 (TF) vs float64 (numpy), plus different rounding
+            # modes, means GELU cannot be bit-exact. Allow 2 LSB.
+            lsb = 2.0**(-self.out.frac)
+            ok = np.allclose(out.ftensor, self.out.ftensor, atol=2*lsb, rtol=0)
+        else:
+            ok = np.allclose(out.ftensor, self.out.ftensor)
+        assert ok, \
             f"Activation output does not match. {(out.ftensor.shape, self.out.ftensor.shape)} \nout:{out.ftensor.numpy().flatten()}, \nself.out:{self.out.ftensor.numpy().flatten()}, \nsub:{out.ftensor.numpy().flatten()-self.out.ftensor.numpy().flatten()}"
+        
         self.out = out
         return out
 

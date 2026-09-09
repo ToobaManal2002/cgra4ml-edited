@@ -16,7 +16,7 @@ from deepsocflow.py.dataflow import *
 @keras.saving.register_keras_serializable()
 class XBundle(Layer):
 
-    def __init__(self, core, pool=None, add_act=None, flatten=False, softmax=False, *args, **kwargs):
+    def __init__(self, core, pool=None, add_act=None, flatten=False, softmax=False, layernorm=False , *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.core = core
         self.pool = pool
@@ -30,6 +30,22 @@ class XBundle(Layer):
         self.out = XTensor(None, None, float_only=True)
         self.softmax_max_i = 0
         self.softmax_frac = 0
+        
+        # NEW LayerNorm
+        self.layernorm = layernorm
+        self.ln_gamma = None  # Will hold gamma weights after training
+        self.ln_beta = None   # Will hold beta weights after training
+        if layernorm:
+            # Must match call_int() below AND apply_layernorm() in runtime.h.
+            # Keras defaults to 1e-3, which does NOT match our C code.
+            self.ln_eps = 1e-5
+            self.ln_frac = 0      # NEW: set in call_int(), read by runtime.h
+            self.ln_layer = keras.layers.LayerNormalization(epsilon=self.ln_eps)
+            # Quantizer for the LayerNorm output. Without this the float path
+            # stays full-precision and can never match the integer path.
+            self.ln_act = XActivation(sys_bits=core.sys_bits,
+                                      o_int_bits=core.act.o_int_bits, type=None)
+        # END NEW
 
         self.ib = None
         self.prev_ib = None
@@ -68,14 +84,19 @@ class XBundle(Layer):
             x = self.pool.act(x)
         if self.flatten:
             x = self.flatten(x)
+                
+        if self.layernorm:                    # >>> NEW
+            x = self.ln_layer(x)              # >>> NEW
+            x = self.ln_act(x)                # >>> NEW: quantize onto the grid
+
         if self.softmax:
             x = self.softmax(x)
             self.out.ftensor = x
 
         self.out.ftensor = x
         x.ib = self.ib
-        return x
-    
+        return x    
+       
     def call_int(self, x, hw):
 
         self.inp = x if self.ib == 0 else BUNDLES[self.prev_ib].out
@@ -94,6 +115,22 @@ class XBundle(Layer):
 
         if self.flatten:
             out = XTensor(tensor=out.itensor.numpy().reshape(out.itensor.shape[0],-1), bits=out.bits, frac=out.frac, from_int=True)
+        
+        if self.layernorm:                                              # >>> NEW START
+            self.ln_gamma = self.ln_layer.gamma.numpy()
+            self.ln_beta = self.ln_layer.beta.numpy()
+            self.ln_frac = out.frac   # NEW: frac bits apply_layernorm() needs
+            
+
+            x_arr = out.itensor.numpy().astype(float) / (2**out.frac)
+            mean = x_arr.mean(axis=-1, keepdims=True)
+            var = x_arr.var(axis=-1, keepdims=True)
+            x_norm = (x_arr - mean) / np.sqrt(var + self.ln_eps)    #new addition
+            ln_out = self.ln_gamma * x_norm + self.ln_beta
+            ln_int = np.round(ln_out * (2**out.frac)).astype(int)
+            ln_int = np.clip(ln_int, -2**(out.bits-1), 2**(out.bits-1)-1)
+            out = XTensor(tensor=ln_int, bits=out.bits, frac=out.frac, from_int=True)
+                                                                        # >>> NEW END
             
         if self.softmax:
             self.pre_softmax = deepcopy(out)
@@ -109,9 +146,19 @@ class XBundle(Layer):
             out.ftensor = tf.convert_to_tensor(softmax_out, dtype=tf.float32) # replace with one calc from int
             out.from_int = False
             out.float_only = True
+       
         else:
-            assert np.allclose(out.ftensor, self.out.ftensor), \
+            # LayerNorm involves division and a square root, so the integer
+            # path can never be bit-exact against a float32 reference the way
+            # convolution can. Verify to within 2 LSB instead.
+            if self.layernorm:
+                lsb = 2.0**(-out.frac)
+                ok = np.allclose(out.ftensor, self.out.ftensor, atol=2*lsb, rtol=0)
+            else:
+                ok = np.allclose(out.ftensor, self.out.ftensor)
+            assert ok, \
                 f"Bundle output does not match. \nout:{out.ftensor.numpy().flatten()[:100]}, \nself.out:{self.out.ftensor.numpy().flatten()[:100]}"
+        
         
         self.out = out
 
